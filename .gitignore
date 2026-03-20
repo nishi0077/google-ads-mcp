@@ -18,6 +18,7 @@ env/
 .env
 *.env
 service_account_credentials.json
+client_secret*.json
 credentials.json
 token.json
 
@@ -52,6 +53,7 @@ site/
 *.log
 
 google_ads_token.json
+.license_cache
 
 uv.lock
 

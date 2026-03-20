@@ -51,6 +51,68 @@ GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN")
 GOOGLE_ADS_LOGIN_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "")
 GOOGLE_ADS_AUTH_TYPE = os.environ.get("GOOGLE_ADS_AUTH_TYPE", "oauth")  # oauth or service_account
 
+# License verification
+LICENSE_KEY = os.environ.get("GOOGLE_ADS_MCP_LICENSE_KEY", "")
+LICENSE_SERVER_URL = os.environ.get("GOOGLE_ADS_MCP_LICENSE_SERVER", "https://your-domain.com/api/verify")
+_LICENSE_CACHE_FILE = Path(__file__).parent / ".license_cache"
+_LICENSE_CACHE_TTL = timedelta(hours=24)
+
+
+def _verify_license() -> bool:
+    """Verify license key against the license server. Uses a local cache to avoid
+    blocking startup when the network is unavailable."""
+    if not LICENSE_KEY:
+        logger.error("GOOGLE_ADS_MCP_LICENSE_KEY is not set. Get a license at %s", LICENSE_SERVER_URL.rsplit("/api", 1)[0])
+        return False
+
+    if _LICENSE_CACHE_FILE.exists():
+        try:
+            cache = json.loads(_LICENSE_CACHE_FILE.read_text())
+            cached_at = datetime.fromisoformat(cache.get("cached_at", ""))
+            if datetime.now() - cached_at < _LICENSE_CACHE_TTL and cache.get("valid"):
+                logger.debug("License valid (cached)")
+                return True
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    try:
+        resp = requests.post(
+            LICENSE_SERVER_URL,
+            json={"license_key": LICENSE_KEY},
+            timeout=10,
+        )
+        data = resp.json()
+
+        if resp.status_code == 200 and data.get("valid"):
+            _LICENSE_CACHE_FILE.write_text(json.dumps({
+                "valid": True,
+                "plan": data.get("plan", ""),
+                "expires_at": data.get("expires_at", ""),
+                "cached_at": datetime.now().isoformat(),
+            }))
+            try:
+                _LICENSE_CACHE_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)
+            except OSError:
+                pass
+            logger.info("License verified successfully (plan: %s)", data.get("plan"))
+            return True
+
+        error_msg = data.get("error", "Invalid license")
+        logger.error("License verification failed: %s", error_msg)
+        return False
+
+    except requests.RequestException:
+        if _LICENSE_CACHE_FILE.exists():
+            try:
+                cache = json.loads(_LICENSE_CACHE_FILE.read_text())
+                if cache.get("valid"):
+                    logger.warning("Network unavailable, using cached license")
+                    return True
+            except (json.JSONDecodeError, ValueError):
+                pass
+        logger.error("Cannot reach license server and no valid cache exists")
+        return False
+
 def format_customer_id(customer_id: str) -> str:
     """Format customer ID to ensure it's 10 digits without dashes."""
     # Convert to string if passed as integer or another type
@@ -400,6 +462,195 @@ async def get_ad_performance(
     """
     
     return await execute_gaql_query(customer_id, query)
+
+
+@mcp.tool()
+async def get_ad_group_performance(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '1234567890'"),
+    days: int = Field(default=30, description="Number of days to look back (7, 30, 90, etc.)")
+) -> str:
+    """Get ad group performance metrics (impressions, clicks, cost, conversions, CPC) for a time period."""
+    query = f"""
+        SELECT
+            campaign.name,
+            ad_group.id,
+            ad_group.name,
+            ad_group.status,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.cost_micros,
+            metrics.conversions,
+            metrics.average_cpc,
+            metrics.ctr
+        FROM ad_group
+        WHERE segments.date DURING LAST_{days}_DAYS
+          AND ad_group.status != 'REMOVED'
+        ORDER BY metrics.cost_micros DESC
+        LIMIT 50
+    """
+    return await execute_gaql_query(customer_id, query)
+
+
+@mcp.tool()
+async def get_search_terms(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '1234567890'"),
+    days: int = Field(default=30, description="Number of days to look back (7, 30, 90, etc.)"),
+    campaign_id: str = Field(default=None, description="Optional: filter by campaign ID"),
+    min_impressions: int = Field(default=1, description="Minimum impressions to include")
+) -> str:
+    """Get search terms report showing actual queries that triggered ads. Essential for finding new keywords and negative keywords."""
+    campaign_filter = f"AND campaign.id = {campaign_id}" if campaign_id else ""
+    query = f"""
+        SELECT
+            search_term_view.search_term,
+            campaign.name,
+            ad_group.name,
+            search_term_view.status,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.cost_micros,
+            metrics.conversions,
+            metrics.ctr
+        FROM search_term_view
+        WHERE segments.date DURING LAST_{days}_DAYS
+          AND metrics.impressions >= {min_impressions}
+          {campaign_filter}
+        ORDER BY metrics.impressions DESC
+        LIMIT 100
+    """
+    return await execute_gaql_query(customer_id, query)
+
+
+@mcp.tool()
+async def get_keyword_quality_scores(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '1234567890'"),
+    campaign_id: str = Field(default=None, description="Optional: filter by campaign ID")
+) -> str:
+    """Get keyword quality scores including expected CTR, ad relevance, and landing page experience."""
+    campaign_filter = f"AND campaign.id = {campaign_id}" if campaign_id else ""
+    query = f"""
+        SELECT
+            campaign.name,
+            ad_group.name,
+            ad_group_criterion.keyword.text,
+            ad_group_criterion.keyword.match_type,
+            ad_group_criterion.quality_info.quality_score,
+            ad_group_criterion.quality_info.creative_quality_score,
+            ad_group_criterion.quality_info.search_predicted_ctr,
+            ad_group_criterion.quality_info.post_click_quality_score,
+            ad_group_criterion.status,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.cost_micros
+        FROM keyword_view
+        WHERE ad_group_criterion.status != 'REMOVED'
+          {campaign_filter}
+        ORDER BY metrics.impressions DESC
+        LIMIT 100
+    """
+    return await execute_gaql_query(customer_id, query)
+
+
+@mcp.tool()
+async def get_device_performance(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '1234567890'"),
+    days: int = Field(default=30, description="Number of days to look back (7, 30, 90, etc.)"),
+    campaign_id: str = Field(default=None, description="Optional: filter by campaign ID")
+) -> str:
+    """Get performance breakdown by device type (mobile, desktop, tablet)."""
+    campaign_filter = f"AND campaign.id = {campaign_id}" if campaign_id else ""
+    query = f"""
+        SELECT
+            campaign.name,
+            segments.device,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.cost_micros,
+            metrics.conversions,
+            metrics.ctr,
+            metrics.average_cpc
+        FROM campaign
+        WHERE segments.date DURING LAST_{days}_DAYS
+          {campaign_filter}
+        ORDER BY campaign.name, metrics.impressions DESC
+    """
+    return await execute_gaql_query(customer_id, query)
+
+
+@mcp.tool()
+async def get_geo_performance(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '1234567890'"),
+    days: int = Field(default=30, description="Number of days to look back (7, 30, 90, etc.)"),
+    campaign_id: str = Field(default=None, description="Optional: filter by campaign ID")
+) -> str:
+    """Get performance by geographic location (country, region, city)."""
+    campaign_filter = f"AND campaign.id = {campaign_id}" if campaign_id else ""
+    query = f"""
+        SELECT
+            campaign.name,
+            geographic_view.country_criterion_id,
+            geographic_view.location_type,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.cost_micros,
+            metrics.conversions,
+            metrics.ctr
+        FROM geographic_view
+        WHERE segments.date DURING LAST_{days}_DAYS
+          AND metrics.impressions > 0
+          {campaign_filter}
+        ORDER BY metrics.impressions DESC
+        LIMIT 50
+    """
+    return await execute_gaql_query(customer_id, query)
+
+
+@mcp.tool()
+async def list_conversion_actions(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '1234567890'")
+) -> str:
+    """List all configured conversion actions and their settings."""
+    query = """
+        SELECT
+            conversion_action.id,
+            conversion_action.name,
+            conversion_action.type,
+            conversion_action.status,
+            conversion_action.category,
+            conversion_action.counting_type,
+            conversion_action.include_in_conversions_metric,
+            metrics.conversions,
+            metrics.conversions_value
+        FROM conversion_action
+        ORDER BY metrics.conversions DESC
+    """
+    return await execute_gaql_query(customer_id, query)
+
+
+@mcp.tool()
+async def get_change_history(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '1234567890'"),
+    days: int = Field(default=7, description="Number of days to look back (default: 7)")
+) -> str:
+    """Get recent change history showing what was modified in the account."""
+    query = f"""
+        SELECT
+            change_event.change_date_time,
+            change_event.change_resource_type,
+            change_event.resource_change_operation,
+            change_event.user_email,
+            change_event.client_type,
+            change_event.changed_fields,
+            change_event.old_resource,
+            change_event.new_resource,
+            campaign.name
+        FROM change_event
+        WHERE change_event.change_date_time DURING LAST_{days}_DAYS
+        ORDER BY change_event.change_date_time DESC
+        LIMIT 50
+    """
+    return await execute_gaql_query(customer_id, query)
+
 
 @mcp.tool()
 async def run_gaql(
@@ -2531,5 +2782,12 @@ async def add_campaign_negative_keywords(
 
 
 if __name__ == "__main__":
-    # Start the MCP server on stdio transport
+    if not _verify_license():
+        import sys
+        print("\n" + "=" * 60, file=sys.stderr)
+        print("  LICENSE ERROR: Valid license required to run this server.", file=sys.stderr)
+        print("  Set GOOGLE_ADS_MCP_LICENSE_KEY in your .env file.", file=sys.stderr)
+        print("  Purchase a license: https://your-domain.com", file=sys.stderr)
+        print("=" * 60 + "\n", file=sys.stderr)
+        sys.exit(1)
     mcp.run(transport="stdio")
