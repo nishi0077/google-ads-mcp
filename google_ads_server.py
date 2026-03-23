@@ -113,6 +113,16 @@ def _verify_license() -> bool:
         logger.error("Cannot reach license server and no valid cache exists")
         return False
 
+def _date_range(days: int) -> str:
+    """Convert days to GAQL date range. Uses predefined literals when possible, otherwise BETWEEN."""
+    _literals = {7: "LAST_7_DAYS", 14: "LAST_14_DAYS", 30: "LAST_30_DAYS"}
+    if days in _literals:
+        return f"DURING {_literals[days]}"
+    end = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    return f"BETWEEN '{start}' AND '{end}'"
+
+
 def format_customer_id(customer_id: str) -> str:
     """Format customer ID to ensure it's 10 digits without dashes."""
     # Convert to string if passed as integer or another type
@@ -431,7 +441,7 @@ async def get_campaign_performance(
             metrics.conversions,
             metrics.average_cpc
         FROM campaign
-        WHERE segments.date DURING LAST_{days}_DAYS
+        WHERE segments.date {_date_range(days)}
         ORDER BY metrics.cost_micros DESC
         LIMIT 50
     """
@@ -456,7 +466,7 @@ async def get_ad_performance(
             metrics.cost_micros,
             metrics.conversions
         FROM ad_group_ad
-        WHERE segments.date DURING LAST_{days}_DAYS
+        WHERE segments.date {_date_range(days)}
         ORDER BY metrics.impressions DESC
         LIMIT 50
     """
@@ -483,7 +493,7 @@ async def get_ad_group_performance(
             metrics.average_cpc,
             metrics.ctr
         FROM ad_group
-        WHERE segments.date DURING LAST_{days}_DAYS
+        WHERE segments.date {_date_range(days)}
           AND ad_group.status != 'REMOVED'
         ORDER BY metrics.cost_micros DESC
         LIMIT 50
@@ -512,7 +522,7 @@ async def get_search_terms(
             metrics.conversions,
             metrics.ctr
         FROM search_term_view
-        WHERE segments.date DURING LAST_{days}_DAYS
+        WHERE segments.date {_date_range(days)}
           AND metrics.impressions >= {min_impressions}
           {campaign_filter}
         ORDER BY metrics.impressions DESC
@@ -570,7 +580,7 @@ async def get_device_performance(
             metrics.ctr,
             metrics.average_cpc
         FROM campaign
-        WHERE segments.date DURING LAST_{days}_DAYS
+        WHERE segments.date {_date_range(days)}
           {campaign_filter}
         ORDER BY campaign.name, metrics.impressions DESC
     """
@@ -596,7 +606,7 @@ async def get_geo_performance(
             metrics.conversions,
             metrics.ctr
         FROM geographic_view
-        WHERE segments.date DURING LAST_{days}_DAYS
+        WHERE segments.date {_date_range(days)}
           AND metrics.impressions > 0
           {campaign_filter}
         ORDER BY metrics.impressions DESC
@@ -645,7 +655,7 @@ async def get_change_history(
             change_event.new_resource,
             campaign.name
         FROM change_event
-        WHERE change_event.change_date_time DURING LAST_{days}_DAYS
+        WHERE change_event.change_date_time {_date_range(days)}
         ORDER BY change_event.change_date_time DESC
         LIMIT 50
     """
